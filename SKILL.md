@@ -16,7 +16,7 @@ description: Zeabur 部署指南 — 涵蓋兩種架構：(A) Vite + Express 全
 | 後端 | Express（tsx） | 無（純靜態） |
 | 靜態服務 | Express serve dist/ | Caddy |
 | Docker base | node:22-alpine | node:20-alpine → caddy:2-alpine |
-| Port | 8080 | 80 |
+| Port | 8080 | `{$PORT:8080}`（Zeabur 動態注入） |
 | 啟動 | `tsx server/production.ts` | Caddy 自動啟動 |
 
 ---
@@ -124,22 +124,44 @@ RUN npm run build
 
 FROM caddy:2-alpine
 COPY --from=builder /app/dist /usr/share/caddy
-COPY <<'EOF' /etc/caddy/Caddyfile
-:80 {
+COPY Caddyfile /etc/caddy/Caddyfile
+EXPOSE 8080
+```
+
+### Caddyfile 範本
+
+```caddyfile
+:{$PORT:8080} {
     root * /usr/share/caddy
     try_files {path} /index.html
     file_server
     encode gzip
 }
-EOF
-EXPOSE 80
+```
+
+### ⚠️ Caddy 端口配置（502 Bad Gateway 的常見原因）
+
+**Zeabur 會注入 `PORT` 環境變數**，容器必須監聽該端口。Caddy 寫死 `:80` 會導致 502 Bad Gateway — Zeabur 的 reverse proxy 無法連到你的容器。
+
+```caddyfile
+# ❌ 錯誤 — 寫死 :80，Zeabur 路由找不到
+:80 {
+    ...
+}
+
+# ✅ 正確 — 讀取 PORT 環境變數，預設 8080
+:{$PORT:8080} {
+    ...
+}
 ```
 
 **關鍵要點：**
 - **必須用多階段構建**：在 builder 階段 `npm ci` + `npm run build`，再將 `dist/` 複製到 Caddy
+- **`:{$PORT:8080}`**：Zeabur 動態注入端口，**絕不能寫死 `:80`**，否則 502
 - **`try_files {path} /index.html`**：SPA 必要，確保 React Router 的子路由不會 404
 - **不要用 `zeabur/caddy-static`**：它不會執行構建步驟，只適合預構建的靜態檔案
 - **`encode gzip`**：啟用壓縮，改善載入速度
+- **Caddyfile 獨立檔案**：放 repo 根目錄，Dockerfile 用 `COPY Caddyfile /etc/caddy/Caddyfile`
 
 ### 常見失敗：使用 zeabur/caddy-static 但無構建
 
@@ -236,13 +258,16 @@ git push origin main
 # 1. 本地建置驗證
 npm run build  # 確認無 TypeScript 錯誤
 
-# 2. 本地 Docker 測試（可選）
-docker build -t test-app . && docker run -p 8080:80 test-app
+# 2. 確認 Caddyfile 使用動態端口
+grep 'PORT' Caddyfile  # 應看到 :{$PORT:8080}
 
-# 3. 確認 package-lock.json 已 commit
+# 3. 本地 Docker 測試（可選）
+docker build -t test-app . && docker run -p 8080:8080 test-app
+
+# 4. 確認 package-lock.json 已 commit
 git status
 
-# 4. 推送
+# 5. 推送
 git push origin main
 ```
 
@@ -250,27 +275,35 @@ git push origin main
 
 ## 常見問題排解
 
-### 1. 部署後白畫面 / 500
+### 1. 502 Bad Gateway（Caddy 端口不匹配）
+
+**症狀：** Cloudflare 顯示 502，Host 為 Error。Zeabur 日誌可能顯示容器正常但無法連接。
+
+**原因：** Caddyfile 寫死 `:80`，但 Zeabur 的 reverse proxy 期望容器監聽 `PORT` 環境變數指定的端口。
+
+**解法：** Caddyfile 使用 `:{$PORT:8080}` 取代 `:80`。
+
+### 2. 部署後白畫面 / 500
 
 - **模式 A：** 檢查 `production.ts` import，搜尋 `Cannot find module`
 - **模式 B：** 檢查 Dockerfile 是否正確複製 `dist/` 到 Caddy 目錄
 
-### 2. Zeabur 未觸發自動部署
+### 3. Zeabur 未觸發自動部署
 
 ```bash
 git commit --allow-empty -m "chore: trigger deployment"
 git push origin main
 ```
 
-### 3. dist/ 找不到
+### 4. dist/ 找不到
 
 確認 `npm run build` 在 Dockerfile 的 builder 階段執行，且 `COPY --from=builder` 路徑正確。
 
-### 4. 環境變數
+### 5. 環境變數
 
 Zeabur Dashboard → Service → Variables。常用：`SUPABASE_URL`、`ANTHROPIC_API_KEY`、`SENTRY_DSN`
 
-### 5. npm ci 失敗（peer deps）
+### 6. npm ci 失敗（peer deps）
 
 在 Dockerfile 中暫時改為：
 ```dockerfile
