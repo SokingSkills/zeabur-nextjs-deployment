@@ -66,15 +66,20 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev --legacy-peer-deps
 
+# ⚠️ 白名單 COPY — 必須涵蓋所有 server-side import 依賴的目錄
 COPY dist/ ./dist/
 COPY server/ ./server/
 COPY api/ ./api/
 COPY lib/ ./lib/
+COPY data/ ./data/
+COPY components/ ./components/
+COPY types/ ./types/
+COPY "開課排程/" "./開課排程/"
 
 # 驗證 dist 存在
 RUN test -d dist && test -f dist/index.html
 
-# 驗證 server import
+# 驗證 server import（建置階段攔截缺少的目錄/檔案）
 RUN npx tsx -e "import('./server/production.ts').then(() => { \
   console.log('All server imports resolved'); process.exit(0); \
 }).catch(e => { \
@@ -85,14 +90,36 @@ EXPOSE 8080
 CMD ["npm", "start"]
 ```
 
+### ⚠️ Dockerfile 白名單 COPY 陷阱
+
+**Dockerfile 採用白名單模式——只 COPY 明確列出的目錄。** 這表示：
+
+1. **新增 server-side 對新目錄的 import 時，必須同步更新 Dockerfile 的 COPY 清單**
+2. 即使檔案已在 Git 追蹤，若 Dockerfile 沒有 COPY 該目錄，容器裡就不會有
+3. Import 驗證步驟（`npx tsx -e "import(...)"`) 會在 build 階段捕捉這類錯誤
+
+**實際案例（2026-03-17）：**
+- `lib/aeo-schemas.ts` import 了 `components/guides/guides-data`（產生 JSON-LD 結構化資料）
+- `api/report/demo-agent-chat.ts` import 了 `data/demo-default-prompt`
+- 多個 `lib/` 檔案 import 了 `types/` 下的型別定義
+- 這些目錄都在 Git 中，但 Dockerfile 沒有 COPY → runtime `ERR_MODULE_NOT_FOUND`
+
+**排查步驟：** 當出現 `Cannot find module '/app/xxx/yyy'` 錯誤時：
+1. 確認該檔案已 commit 到 Git（`git ls-files xxx/yyy`）
+2. 確認 Dockerfile 有 COPY 該檔案所在的頂層目錄
+3. 確認 `.dockerignore` 沒有排除該目錄
+
 ### ⚠️ Import 防護機制
 
-**正式站崩潰的頭號原因：`server/production.ts` import 了未 commit 的檔案。**
+**正式站崩潰的兩大原因：**
+1. `server/production.ts` import 了未 commit 的檔案
+2. Dockerfile 缺少 server-side code 依賴的目錄
 
 新增或修改 API 端點時：
 1. 建立 API handler 檔案
 2. 在 `server/production.ts` 加入 import 與路由
 3. **兩者必須同時 commit**
+4. **若 handler import 了新的頂層目錄，更新 Dockerfile COPY 清單**
 
 ```bash
 # 正確
@@ -101,6 +128,14 @@ git add api/admin/new-feature.ts server/production.ts
 # 錯誤 — 漏掉新建的 handler
 git add server/production.ts  # ❌
 ```
+
+### ⚠️ Zeabur Build Cache
+
+Zeabur 平台會快取 Docker build layer。修改 Dockerfile 後若部署仍出現舊錯誤：
+
+1. **先確認 push 成功** — `git log origin/main` 確認遠端有最新 commit
+2. **Zeabur Dashboard → Redeploy → 勾選「No Cache」** 強制全新構建
+3. 修改 Dockerfile 註解（不影響功能）也能破壞 cache，但不如 No Cache 可靠
 
 ---
 
@@ -239,16 +274,20 @@ label={({ name, percent }: { name?: string; percent?: number }) =>
 ### 模式 A（全端）
 
 ```bash
-# 1. 驗證 server import
+# 1. 驗證 server import（本地環境）
 npx tsx -e "import('./server/production.ts')"
 
-# 2. 建置前端
+# 2. 檢查 Dockerfile COPY 清單是否涵蓋所有 server-side 依賴目錄
+# （若新增了對 pages/、scripts/ 等目錄的 import，需更新 Dockerfile）
+grep '^COPY' Dockerfile
+
+# 3. 建置前端
 npm run build
 
-# 3. 檢查未 commit 的檔案
+# 4. 檢查未 commit 的檔案
 git status
 
-# 4. 推送
+# 5. 推送
 git push origin main
 ```
 
@@ -283,9 +322,12 @@ git push origin main
 
 **解法：** Caddyfile 使用 `:{$PORT:8080}` 取代 `:80`。
 
-### 2. 部署後白畫面 / 500
+### 2. 部署後白畫面 / 500 / ERR_MODULE_NOT_FOUND
 
-- **模式 A：** 檢查 `production.ts` import，搜尋 `Cannot find module`
+- **模式 A：**
+  - 檢查 `production.ts` import，搜尋 `Cannot find module`
+  - **確認 Dockerfile COPY 清單包含錯誤訊息中的目錄**（如 `/app/components/xxx` → 需要 `COPY components/`）
+  - 若修改 Dockerfile 後仍失敗，用 Zeabur Dashboard **Redeploy without cache**
 - **模式 B：** 檢查 Dockerfile 是否正確複製 `dist/` 到 Caddy 目錄
 
 ### 3. Zeabur 未觸發自動部署
